@@ -1,5 +1,5 @@
 name: Exportar despachos
-
+ 
 # ==========================================================================
 # HORARIO: Lunes a sabado, de 8:00 a 19:00 hora Peru, cada 30 minutos.
 # GitHub trabaja en hora UTC; Peru es UTC-5, por eso las horas van +5.
@@ -12,34 +12,43 @@ on:
     # La corrida de las 19:00 hora Peru (medianoche UTC del dia siguiente):
     - cron: "0 0 * * 0,2,3,4,5,6"
   workflow_dispatch:   # permite ejecutarlo a mano desde la pestana Actions
-
+ 
 permissions:
   contents: write
-
+ 
 jobs:
   exportar:
     runs-on: ubuntu-latest
     steps:
       - name: Descargar el repositorio
         uses: actions/checkout@v4
-
+ 
       - name: Instalar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
+ 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
-
+ 
       - name: Ejecutar el script
         env:
           DISPATCHTRACK_API_KEY: ${{ secrets.DISPATCHTRACK_API_KEY }}
         run: python exportar_despachos.py
-
+ 
       - name: Guardar el Excel en el repositorio
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add reportes/
           git commit -m "Actualizar despachos $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "Sin cambios"
-          git push
+          # Sube el Excel, pero primero trae lo que haya cambiado en el
+          # repositorio para no chocar. Reintenta por si algo entra en medio.
+          for intento in 1 2 3 4 5; do
+            git pull --rebase --autostash -X theirs origin main && \
+            git push origin main && exit 0
+            echo "El push fallo, reintento $intento..."
+            sleep 5
+          done
+          echo "No se pudo subir despues de varios intentos"
+          exit 1
