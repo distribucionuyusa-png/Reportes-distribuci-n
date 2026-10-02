@@ -57,6 +57,37 @@ def _unique_headers(cols):
     return result
 
 
+COL_LLEGADA = "Tiempo de llegada"     # hora en que llega al punto
+COL_CIERRE = "Fecha Llegada"          # hora en que cierra la gestion
+COL_TIEMPO = "Tiempo en cliente (min)"
+
+
+def _segundos_del_dia(s: pd.Series) -> pd.Series:
+    """Toma solo la HORA de un valor fecha-hora y la devuelve en segundos."""
+    dt = pd.to_datetime(s, errors="coerce")
+    return dt.dt.hour * 3600 + dt.dt.minute * 60 + dt.dt.second
+
+
+def _agregar_tiempo_en_cliente(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Minutos que el chofer estuvo en el punto: hora de "Fecha Llegada" menos
+    hora de "Tiempo de llegada" (solo se compara la hora, no la fecha).
+    Queda vacio si falta alguna de las dos horas o si el resultado es negativo.
+    La columna se ubica justo despues de "Fecha Llegada".
+    """
+    if COL_TIEMPO in df.columns:
+        df = df.drop(columns=[COL_TIEMPO])
+    if COL_LLEGADA not in df.columns or COL_CIERRE not in df.columns:
+        return df
+
+    minutos = (_segundos_del_dia(df[COL_CIERRE]) - _segundos_del_dia(df[COL_LLEGADA])) / 60
+    minutos = minutos.where(minutos >= 0).round(1)
+
+    pos = df.columns.get_loc(COL_CIERRE) + 1
+    df.insert(pos, COL_TIEMPO, minutos)
+    return df
+
+
 def main():
     if not os.path.exists(SNAPSHOT):
         raise SystemExit(f"No se encontro el corte diario: {SNAPSHOT}")
@@ -98,6 +129,8 @@ def main():
     # orden de lectura: por fecha de corte y luego Orden
     sort_cols = [c for c in [CUT_COL, KEY] if c in combinado.columns]
     combinado = combinado.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
+    combinado = _agregar_tiempo_en_cliente(combinado)
 
     nuevas = combinado[KEY].nunique() - antes
     actualizadas = len(snap) - max(nuevas, 0)
