@@ -4,13 +4,15 @@ acumular.py
 -----------
 Fusiona el corte diario de DispatchTrack (reportes/despachos_diarios.xls)
 dentro de un maestro acumulado (historico/historico_despachos.xlsx),
-usando el N. de Orden como llave unica (upsert):
+usando como llave unica N. de Orden + Fecha ruta (upsert):
 
-  - Si la Orden ya existe en el maestro  -> se actualiza con el dato mas reciente.
-  - Si la Orden es nueva                  -> se agrega.
+  - Misma Orden y misma Fecha ruta  -> se actualiza con el dato mas reciente
+                                       (queda el cierre de ese dia).
+  - Misma Orden en otra Fecha ruta  -> se agrega una fila nueva; la del dia
+                                       anterior se conserva intacta.
 
-Agrega la columna "Fecha de corte" (fecha local de Peru del momento en que corre)
-y guarda el resultado como una Tabla de Excel con nombre fijo (tbl_historico),
+Columnas agregadas: "Fecha de corte", "Llave" (Orden|Fecha ruta),
+"Último intento" (Sí/No) y "Tiempo en cliente (min)". Guarda el resultado como una Tabla de Excel con nombre fijo (tbl_historico),
 en la hoja HISTORICO, conservando TODAS las columnas del export. Si algun dia el
 export trae columnas nuevas, el maestro las incorpora sin perder las anteriores.
 """
@@ -88,28 +90,66 @@ def _agregar_tiempo_en_cliente(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+DATE_COL = "Fecha ruta"               # dia real en que la orden salio en ruta
+LLAVE_COL = "Llave"                   # Orden|Fecha ruta  (ej. 260047863|2026-10-02)
+ULT_COL = "Último intento"            # Sí = fila mas reciente de esa Orden
+DERIVADAS = [LLAVE_COL, ULT_COL, COL_TIEMPO]
+
+
+def _norm_fecha(s: pd.Series, respaldo) -> pd.Series:
+    """Fecha como texto AAAA-MM-DD; si falta, usa el valor de respaldo."""
+    f = pd.to_datetime(s, errors="coerce").dt.strftime("%Y-%m-%d")
+    if isinstance(respaldo, pd.Series):
+        respaldo = pd.to_datetime(respaldo, errors="coerce").dt.strftime("%Y-%m-%d")
+    return f.fillna(respaldo)
+
+
+def _preparar(df: pd.DataFrame, respaldo_fecha) -> pd.DataFrame:
+    """Normaliza Orden y Fecha ruta, quita columnas derivadas y arma la Llave."""
+    df = df.drop(columns=[c for c in DERIVADAS if c in df.columns])
+    df[KEY] = _norm_key(df[KEY])
+    df = df[df[KEY] != ""].copy()
+    df[DATE_COL] = _norm_fecha(
+        df[DATE_COL] if DATE_COL in df.columns else pd.Series(index=df.index, dtype="object"),
+        respaldo_fecha,
+    )
+    df[LLAVE_COL] = df[KEY] + "|" + df[DATE_COL].fillna("")
+    return df
+
+
+def _agregar_ultimo_intento(df: pd.DataFrame) -> pd.DataFrame:
+    """Marca 'Sí' en la fila de la fecha de ruta mas reciente de cada Orden."""
+    ultima = df.groupby(KEY)[DATE_COL].transform("max")
+    df[ULT_COL] = (df[DATE_COL] == ultima).map({True: "Sí", False: "No"})
+    return df
+
+
+def _ordenar_columnas(df: pd.DataFrame) -> pd.DataFrame:
+    """Fecha de corte, Llave y Último intento al inicio; el resto como venia."""
+    primeras = [c for c in [CUT_COL, LLAVE_COL, ULT_COL] if c in df.columns]
+    return df[primeras + [c for c in df.columns if c not in primeras]]
+
+
 def main():
     if not os.path.exists(SNAPSHOT):
         raise SystemExit(f"No se encontro el corte diario: {SNAPSHOT}")
+
+    fecha_corte = datetime.now(ZoneInfo("America/Lima")).strftime("%Y-%m-%d")
 
     # 1) Corte del dia
     snap = pd.read_excel(SNAPSHOT, sheet_name=0)
     snap.columns = _unique_headers(snap.columns)
     if KEY not in snap.columns:
         raise SystemExit(f"El corte no tiene la columna llave '{KEY}'.")
-    snap[KEY] = _norm_key(snap[KEY])
-    snap = snap[snap[KEY] != ""]                      # descarta filas sin Orden
-    snap = snap.drop_duplicates(subset=KEY, keep="last")
-
-    fecha_corte = datetime.now(ZoneInfo("America/Lima")).strftime("%Y-%m-%d")
     snap.insert(0, CUT_COL, fecha_corte)
+    snap = _preparar(snap, fecha_corte)
+    snap = snap.drop_duplicates(subset=LLAVE_COL, keep="last")
 
     # 2) Maestro existente (si lo hay)
     if os.path.exists(MASTER):
         master = pd.read_excel(MASTER, sheet_name=SHEET)
         master.columns = _unique_headers(master.columns)
-        if KEY in master.columns:
-            master[KEY] = _norm_key(master[KEY])
+        master = _preparar(master, master[CUT_COL] if CUT_COL in master.columns else fecha_corte)
     else:
         master = pd.DataFrame(columns=snap.columns)
 
@@ -121,18 +161,18 @@ def main():
     master = master.reindex(columns=cols)
     snap = snap.reindex(columns=cols)
 
-    # 4) Upsert: el corte de hoy gana sobre lo que ya habia (keep='last')
-    antes = master[KEY].nunique() if len(master) else 0
+    # 4) Upsert por Orden + Fecha ruta: dentro del mismo dia gana el corte mas
+    #    reciente; si la orden sale otro dia, se agrega una fila nueva.
+    antes = len(master)
     combinado = pd.concat([master, snap], ignore_index=True)
-    combinado = combinado.drop_duplicates(subset=KEY, keep="last").reset_index(drop=True)
+    combinado = combinado.drop_duplicates(subset=LLAVE_COL, keep="last").reset_index(drop=True)
+    combinado = combinado.sort_values([DATE_COL, KEY], na_position="last").reset_index(drop=True)
 
-    # orden de lectura: por fecha de corte y luego Orden
-    sort_cols = [c for c in [CUT_COL, KEY] if c in combinado.columns]
-    combinado = combinado.sort_values(sort_cols, na_position="last").reset_index(drop=True)
-
+    combinado = _agregar_ultimo_intento(combinado)
     combinado = _agregar_tiempo_en_cliente(combinado)
+    combinado = _ordenar_columnas(combinado)
 
-    nuevas = combinado[KEY].nunique() - antes
+    nuevas = len(combinado) - antes
     actualizadas = len(snap) - max(nuevas, 0)
 
     # 5) Escribir maestro como Tabla de Excel
@@ -167,11 +207,11 @@ def main():
     os.remove(tmp)
 
     print(f"Fecha de corte : {fecha_corte}")
-    print(f"Corte del dia  : {len(snap)} ordenes")
-    print(f"Maestro antes  : {antes} ordenes")
+    print(f"Corte del dia  : {len(snap)} filas (orden + fecha ruta)")
+    print(f"Maestro antes  : {antes} filas")
     print(f"  nuevas       : {max(nuevas,0)}")
     print(f"  actualizadas : {max(actualizadas,0)}")
-    print(f"Maestro ahora  : {combinado[KEY].nunique()} ordenes | {nrows} filas x {ncols} columnas")
+    print(f"Maestro ahora  : {nrows} filas ({combinado[KEY].nunique()} ordenes) x {ncols} columnas")
     print(f"Guardado en    : {MASTER} (hoja {SHEET}, tabla {TABLE})")
 
 
