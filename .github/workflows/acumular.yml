@@ -1,0 +1,71 @@
+name: Acumular historico diario (OneDrive)
+
+# ==========================================================================
+# Corre UNA vez al dia, a las 21:00 hora Peru (todos los dias).
+# GitHub usa hora UTC; Peru es UTC-5, por eso 21:00 Peru = 02:00 UTC del dia
+# siguiente. (El cron de GitHub puede atrasarse algunos minutos.)
+#
+# Que hace:
+#   1. Jala un corte FRESCO de DispatchTrack (reportes/despachos_diarios.xls)
+#   2. Lo fusiona por N. de Orden en el maestro historico/historico_despachos.xlsx
+#   3. Commitea el maestro al repositorio (para conservar la acumulacion)
+#   4. Envia el maestro por correo (Power Automate lo guarda en OneDrive)
+# ==========================================================================
+on:
+  schedule:
+    - cron: "0 2 * * *"      # 21:00 hora Peru, todos los dias
+  workflow_dispatch:          # permite ejecutarlo a mano desde la pestana Actions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: acumular-historico
+  cancel-in-progress: false
+
+jobs:
+  acumular:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          pip install pandas openpyxl
+
+      - name: Jalar el corte del dia desde DispatchTrack
+        env:
+          DISPATCHTRACK_API_KEY: ${{ secrets.DISPATCHTRACK_API_KEY }}
+        run: python exportar_despachos.py
+
+      - name: Fusionar en el maestro acumulado
+        run: python acumular.py
+
+      - name: Guardar el maestro en el repositorio
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add historico/ reportes/
+          git commit -m "Acumular historico $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "Sin cambios"
+          for intento in 1 2 3 4 5; do
+            git pull --rebase --autostash -X theirs origin main && \
+            git push origin main && exit 0
+            echo "El push fallo, reintento $intento..."
+            sleep 5
+          done
+          echo "No se pudo subir despues de varios intentos"
+          exit 1
+
+      - name: Enviar el maestro por correo
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python enviar_correo.py
